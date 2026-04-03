@@ -1,0 +1,11 @@
+networks:
+  - name: "baseline"
+    layers: [784, 256, 10]
+    learning_rate: 0.01
+    inference_steps: 20
+    epochs: 10
+  - name: "deep"
+    layers: [784, 512, 256, 128, 10]
+    learning_rate: 0.005
+    inference_steps: 50
+    epochs: 15

@@ -1,0 +1,256 @@
+1.
+
+Create a C++ / CUDA project called `pcn-cuda-mnist` with the following structure:
+
+## Build system
+- CMake 3.20+, C++17, CUDA toolkit 12.x
+- CUDA architecture target: 75 (Turing, Quadro RTX 4000)
+- Static linking: `-cudart static`, `-static-libgcc`, `-static-libstdc++`
+- CMakeLists.txt should produce a single self-contained binary
+
+## Dependencies (fetch via CMake FetchContent or find_package)
+- Dear ImGui (docking branch) + GLFW + OpenGL for UI
+- yaml-cpp for config parsing
+- No ML frameworks — everything is hand-written CUDA
+
+## Project structure to create
+pcn-cuda-mnist/
+├── CMakeLists.txt
+├── config.yaml
+├── src/
+│   ├── main.cpp
+│   ├── gpu_check.cu / .h
+│   ├── mnist_loader.cpp / .h
+│   ├── pcn/
+│   │   ├── network.cu / .h
+│   └── ui/
+│       └── app_window.cpp / .h
+├── scripts/
+│   ├── run.sh
+│   └── package.sh
+
+## config.yaml structure
+networks:
+  - name: "baseline"
+    layers: [784, 256, 10]
+    learning_rate: 0.01
+    inference_steps: 20
+    epochs: 10
+  - name: "deep"
+    layers: [784, 512, 256, 128, 10]
+    learning_rate: 0.005
+    inference_steps: 50
+    epochs: 15
+
+## gpu_check.cu
+Implement a `detectAndSelectGPU()` function that:
+- Calls cudaGetDeviceCount(), exits with a clear error message if 0
+- Prints each found device: name, VRAM in GB, SM version
+- Selects the device with the most VRAM
+- Returns false with human-readable error if no CUDA GPU found
+
+## mnist_loader
+- Auto-download MNIST IDX files from http://yann.lecun.com/exdb/mnist/ 
+  (or mirror: https://storage.googleapis.com/cvdf-datasets/mnist/)
+- Parse IDX binary format into flat float arrays (normalize 0.0–1.0)
+- Split: 90% train, 10% test, shuffled with fixed seed
+- Expose: `MnistDataset` struct with train/test image+label spans
+
+## main.cpp skeleton
+- Call detectAndSelectGPU(), exit if false
+- Load config.yaml, parse all network configs into a vector
+- Load MNIST dataset
+- For each network config: train → evaluate → store results
+- Launch ImGui UI (blocking main loop)
+
+## scripts/run.sh
+Pre-flight checks:
+- /dev/nvidia0 exists
+- nvidia-smi succeeds
+- Print GPU name and driver version
+- Then exec the binary
+
+## scripts/package.sh
+- Run ldd on the binary, copy non-system .so deps to dist/lib/
+- Copy binary, config.yaml, run.sh to dist/
+- Create dist/pcn-mnist-bundle.tar.gz
+
+Do not implement PCN network logic yet — leave network.cu with TODO stubs.
+Do not implement UI yet — leave app_window with a stub.
+Make sure the project compiles cleanly with the stubs in place.
+
+2.
+
+Implement the Predictive Coding Network in `src/pcn/network.cu`.
+
+## Background
+Predictive Coding Networks are energy-based models where:
+- Each layer predicts the activity of the layer below it
+- Prediction errors (ε) drive both inference and learning
+- Weight updates are LOCAL — no global backpropagation
+- During inference, neural activities (μ) are iteratively updated to minimize prediction error
+- Weight update only happens AFTER inference has converged
+
+## Data structures
+```cpp
+struct PCNLayer {
+    float* mu;          // neural activities [size]
+    float* epsilon;     // prediction errors [size]
+    float* weights;     // W [size x prev_size]
+    float* biases;      // b [size]
+    int size;
+    int prev_size;
+};
+
+struct PCNNetwork {
+    std::vector<PCNLayer> layers;
+    float learning_rate;
+    int inference_steps;
+};
+```
+
+## CUDA kernels to implement
+
+### 1. forward_predict_kernel
+For each layer l, compute prediction of layer l-1:
+`pred_{l-1} = f(W_l * mu_l + b_l)`
+where f is tanh activation (except output layer: softmax)
+
+### 2. compute_error_kernel  
+`epsilon_l = mu_l - pred_l`
+(difference between actual activity and prediction from above)
+
+### 3. update_mu_kernel (inference step)
+Update neural activities to minimize energy:
+`mu_l += lr_infer * (-epsilon_l + W_{l+1}^T * epsilon_{l+1})`
+Clamp input layer mu to clamped data values during inference.
+Output layer mu is clamped to one-hot label.
+
+### 4. update_weights_kernel (learning step, called after inference converges)
+`ΔW_l = lr * epsilon_l * mu_{l-1}^T`
+`Δb_l = lr * epsilon_l`
+
+## PCNNetwork methods to implement
+```cpp
+void PCNNetwork::init(const std::vector<int>& layer_sizes, float lr, int inf_steps);
+// Xavier initialization for weights
+
+void PCNNetwork::train_sample(const float* image, int label);
+// 1. Clamp input layer mu to image
+// 2. Clamp output layer mu to one-hot(label)  
+// 3. Run inference_steps iterations:
+//    a. forward_predict_kernel for all layers
+//    b. compute_error_kernel for all layers
+//    c. update_mu_kernel for hidden layers
+// 4. update_weights_kernel for all layers
+
+int PCNNetwork::predict(const float* image);
+// 1. Clamp input, free-run output layer
+// 2. Run inference_steps iterations (no label clamping)
+// 3. Return argmax of output layer mu
+
+float PCNNetwork::evaluate(const float* images, const int* labels, int count);
+// Returns accuracy 0.0–1.0
+```
+
+## Training callback
+Add a callback mechanism:
+```cpp
+using TrainingCallback = std::function<void(int epoch, int sample, float energy)>;
+void PCNNetwork::set_callback(TrainingCallback cb);
+```
+The callback receives current energy (sum of squared errors across all layers) 
+after each sample — this feeds the real-time UI.
+
+## Thread safety
+Training runs on a background std::thread.
+The callback is called from that thread.
+Use std::atomic<float> for shared state between train thread and UI thread.
+
+3.
+
+Implement the ImGui UI in `src/ui/app_window.cpp` and finalize the training loop in main.cpp.
+
+## UI layout
+Single window, full screen, three panels:
+
+### Left panel (30% width) — Config & Control
+- List all networks from config.yaml
+- Each shows: name, layer sizes, lr, inference_steps, epochs
+- "Train All" button — starts sequential training of all configs
+- "Stop" button — graceful stop after current epoch
+- Status indicator per network: Pending / Training / Done / Error
+
+### Center panel (50% width) — Live Training
+- Currently training network name + progress (epoch X/Y, sample N/M)
+- Real-time loss curve (ImGui::PlotLines, last 500 energy values)
+- Current epoch average energy as a number
+- Elapsed time + estimated remaining time
+
+### Right panel (20% width) — Results
+- After each network finishes: accuracy % on test set
+- Per-class accuracy table (digits 0–9, correct/total, %)
+- Best network highlighted
+
+## Training integration in main.cpp
+```cpp
+// Shared state between UI and training thread
+struct TrainingState {
+    std::atomic<bool> running{false};
+    std::atomic<bool> stop_requested{false};
+    std::atomic<int> current_epoch{0};
+    std::atomic<int> current_sample{0};
+    std::atomic<float> current_energy{0.0f};
+    std::vector<float> energy_history;  // protected by mutex
+    std::mutex history_mutex;
+    std::vector<NetworkResult> results; // protected by mutex
+    std::mutex results_mutex;
+};
+
+// Training runs in background thread
+// UI runs in main thread (OpenGL/ImGui requirement)
+```
+
+## ImGui setup
+- GLFW + OpenGL3 backend
+- Window title: "PCN MNIST Trainer — Quadro RTX 4000"
+- Dark theme
+- Font size: 14px, use default ImGui font
+- Target 60 FPS render loop, but training thread is not rate-limited
+
+## package.sh — finalize
+After binary is built:
+1. `ldd ./build/pcn-mnist` — collect non-system deps
+   (exclude: libGL, libGLX, libnvidia* — these must come from target system)
+2. Copy to dist/: binary, collected .so files, config.yaml, run.sh
+3. Write dist/README.txt:
+   "Requirements: Linux, NVIDIA driver 525+, CUDA SM 7.5 compatible GPU
+    Run: ./run.sh"
+4. tar.gz the dist/ folder
+
+## run.sh — finalize  
+#!/bin/bash
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
+echo "=== PCN MNIST Trainer ==="
+
+# GPU check
+if [ ! -e /dev/nvidia0 ]; then
+    echo "ERROR: /dev/nvidia0 not found. Is the NVIDIA driver loaded?"
+    exit 1
+fi
+
+if ! nvidia-smi &>/dev/null; then
+    echo "ERROR: nvidia-smi failed. Check driver installation."
+    exit 1
+fi
+
+echo "GPU found:"
+nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
+
+# Set library path for bundled .so files
+export LD_LIBRARY_PATH="$SCRIPT_DIR/lib:$LD_LIBRARY_PATH"
+
+cd "$SCRIPT_DIR"
+exec ./pcn-mnist "$@"
